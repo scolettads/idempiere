@@ -255,7 +255,14 @@ public class GridTable extends AbstractTableModel
 	/** Keep track of last sorted column index and sort direction */
 	private int 				m_lastSortColumnIndex = -1;
 	private boolean 			m_lastSortedAscending = true;
-
+	
+	
+	/** s.coletta@ads.it - IDEMPIERE-7027 OR_EXPAND hint to inject into the current query: true only
+	 *  after dataRefreshAll with retainedCurrentRow=true, to force Oracle OR-expansion
+	 *  and avoid a FULL TABLE SCAN on the disjunction involving the current row's
+	 *  primary key. Reset at the beginning of dataRefreshAll and in
+	 *  setSelectWhereClause. */
+	private volatile boolean    m_useOrExpandHint = false;
 	/**
 	 *	Set Table Name
 	 *  @param newTableName table name
@@ -315,6 +322,8 @@ public class GridTable extends AbstractTableModel
 		m_whereParams.clear();
 		m_onlyCurrentRows = onlyCurrentRows;
 		m_onlyCurrentDays = onlyCurrentDays;
+		//IDEMPIERE-7027
+		m_useOrExpandHint = false;
 		return true;
 	}	//	setWhereClause
 
@@ -2471,6 +2480,7 @@ public class GridTable extends AbstractTableModel
 		m_inserting = false;	//	should not happen
 		dataIgnore();
 		String retainedWhere = null;
+		m_useOrExpandHint = false;
 		if (rowToRetained >= 0)
 		{
 			retainedWhere = getWhereClause(rowToRetained);
@@ -2484,6 +2494,15 @@ public class GridTable extends AbstractTableModel
 				StringBuilder orRetainedWhere = new StringBuilder(") OR (").append(retainedWhere).append(")) ");
 				if (! tempWhere.contains(orRetainedWhere.toString()))
 					tempWhere = "((" + tempWhere + orRetainedWhere.toString();
+				
+				// Forces Oracle-side OR-expansion: without this hint, the CBO chooses
+				// a FULL TABLE SCAN on flat tables (I_INVOICE and similar) because the
+				// mixed OR condition between the TAB predicate and the current row's
+				// primary key prevents efficient index access. With OR_EXPAND, Oracle
+				// rewrites the query as a UNION ALL with LNNVL predicates, allowing
+				// each branch to use its corresponding index again.
+				m_useOrExpandHint = true;
+				
 			}
 			m_whereClause = new SQLFragment(tempWhere, m_whereClause != null ? m_whereClause.parameters() : null);
 			open(m_maxRows);
@@ -3063,7 +3082,13 @@ public class GridTable extends AbstractTableModel
 			m_rowCountTimeout = false;
 			try
 			{
-				pstmt = DB.prepareStatement(m_SQL_Count, get_TrxName());
+				
+				// s.coletta@ads.it IDEMPIERE-7027 il COUNT(*) usa la WHERE con OR aggiunto da dataRefreshAll e senza hint
+				// Oracle ne fa FULL TABLE SCAN.
+				String sqlCountToRun = m_useOrExpandHint
+					? m_SQL_Count.replaceFirst("(?i)^\\s*SELECT\\b", "SELECT /*+ OR_EXPAND */")
+					: m_SQL_Count;
+				pstmt = DB.prepareStatement(sqlCountToRun, null);
 				setParameter (pstmt, true);
 		        int timeout = MSysConfig.getIntValue(MSysConfig.GRIDTABLE_INITIAL_COUNT_TIMEOUT_IN_SECONDS, 
 		        		DEFAULT_GRIDTABLE_COUNT_TIMEOUT_IN_SECONDS, Env.getAD_Client_ID(Env.getCtx()));
@@ -3118,7 +3143,13 @@ public class GridTable extends AbstractTableModel
 			//	open Statement (closed by Loader.close)
 			try
 			{
-				m_pstmt = DB.prepareStatement(m_SQL, trxName);
+				// s.coletta@ads.it - IDEMPIERE-7027 Injects the OR_EXPAND hint only for queries containing the
+				// retained-row OR condition added by dataRefreshAll. PostgreSQL ignores
+				// the hint comment, so a DB.isOracle() branch is not required.
+				String sqlToRun = m_useOrExpandHint
+					? m_SQL.replaceFirst("(?i)^\\s*SELECT\\b", "SELECT /*+ OR_EXPAND */")
+					: m_SQL;
+				m_pstmt = DB.prepareStatement(sqlToRun, trxName);
 				//ensure not all rows are fetch into memory for virtual table
 				if (m_virtual)
 					m_pstmt.setFetchSize(100);
